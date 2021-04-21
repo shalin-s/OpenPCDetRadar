@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 from tqdm import tqdm
+from nuscenes.utils.data_classes import RadarPointCloud
 
 from ...ops.roiaware_pool3d import roiaware_pool3d_utils
 from ...utils import common_utils
@@ -108,6 +109,49 @@ class NuScenesDataset(DatasetTemplate):
         points = np.concatenate((points, times), axis=1)
         return points
 
+    # NEW for OpenPCDetRadar
+    # Similar to get_lidar_with_sweeps, but for radar
+    # TODO: Finish this
+    # TODO: figure out how to properly load radar data. See how the lidar data loading works and see if similar can be done for radar easily
+    def get_radar_with_sweeps(self, index, max_sweeps=1):
+        info = self.infos[index]
+        radar_chans = ['RADAR_FRONT', 'RADAR_FRONT_RIGHT', 'RADAR_FRONT_LEFT', 'RADAR_BACK_LEFT', 'RADAR_BACK_RIGHT']
+
+        points_all = []
+
+        for radar_chan in radar_chans:
+            radar_path = self.root_path / info['radar_paths'][radar_chan]
+
+            radar_point_cloud = RadarPointCloud.from_file(radar_path)
+            # TODO HERE: FIGURE OUT HOW TO USE THIS INFO PROPERLY, INCLUDING THE PROPER TRANSFORM FOR MULTIPLE CHANNELS
+
+
+
+
+            # points = np.fromfile(str(radar_path), dtype=np.float32, count=-1).reshape([-1, 5])[:, :4]
+
+            sweep_points_list = [points]
+            sweep_times_list = [np.zeros((points.shape[0], 1))]
+
+            for k in np.random.choice(len(info['sweeps']), max_sweeps - 1, replace=False): # TODO: why is this random?
+                points_sweep, times_sweep = self.get_sweep(info['sweeps'][k])
+                sweep_points_list.append(points_sweep)
+                sweep_times_list.append(times_sweep)
+
+            points = np.concatenate(sweep_points_list, axis=0)
+            times = np.concatenate(sweep_times_list, axis=0).astype(points.dtype)
+
+            # TODO: Will need to merge the points from the different radar sensors. And velocities? Need to understand pcd format fully
+
+            points = np.concatenate((points, times), axis=1)
+
+            # TODO: merge/concatenate into points_all for each radar channel, here.
+
+            # RECALL HOW THE MERGING OF RADAR WAS DONE. WHICH AXIS WAS IGNORED? IT WAS HEIGHT, RIGHT?
+
+
+        return points_all
+
     def __len__(self):
         if self._merge_all_iters_to_one_epoch:
             return len(self.infos) * self.total_epochs
@@ -120,6 +164,14 @@ class NuScenesDataset(DatasetTemplate):
 
         info = copy.deepcopy(self.infos[index])
         points = self.get_lidar_with_sweeps(index, max_sweeps=self.dataset_cfg.MAX_SWEEPS)
+
+        # TODO: add usage of get_radar_with_sweeps, and add that to the input_dict, and figure out if prepare_data needs to be adjusted
+        # TODO: Alright I think I figured out approximately how to do this: In prepare_data, there is a call of self.data_processor.forward.
+        # TODO: For self.data_processor.forward, at least for cbgs_pp_multihead.yaml, this calls 3 functions on data_dict, ending with transform_points_to_voxels (in data_processor.py).
+        # TODO: I think it is in transform_points_to_voxels (make a copy of this function and update cbgs_pp_multihead.yaml accordingy),
+        # TODO: that I can add the code to make voxels out of not just lidar data, but also radar data, from data_dict.
+        # TODO: WAIT, but then I can't quite just perform early fusion there; this would need to be done where the voxel mapping to BEV actually occurs
+        # TODO: Need to figure out more about how to construct the model, and specifically the MAP_TO_BEV stuff, to figure this out
 
         input_dict = {
             'points': points,
@@ -296,7 +348,7 @@ class NuScenesDataset(DatasetTemplate):
             pickle.dump(all_db_infos, f)
 
 
-def create_nuscenes_info(version, data_path, save_path, max_sweeps=10):
+def create_nuscenes_info(version, data_path, save_path, max_sweeps=10, max_sweeps_radar=6):
     from nuscenes.nuscenes import NuScenes
     from nuscenes.utils import splits
     from . import nuscenes_utils
@@ -328,7 +380,7 @@ def create_nuscenes_info(version, data_path, save_path, max_sweeps=10):
 
     train_nusc_infos, val_nusc_infos = nuscenes_utils.fill_trainval_infos(
         data_path=data_path, nusc=nusc, train_scenes=train_scenes, val_scenes=val_scenes,
-        test='test' in version, max_sweeps=max_sweeps
+        test='test' in version, max_sweeps=max_sweeps, max_sweeps_radar=max_sweeps_radar
     )
 
     if version == 'v1.0-test':
@@ -353,22 +405,28 @@ if __name__ == '__main__':
     parser.add_argument('--cfg_file', type=str, default=None, help='specify the config of dataset')
     parser.add_argument('--func', type=str, default='create_nuscenes_infos', help='')
     parser.add_argument('--version', type=str, default='v1.0-trainval', help='')
+    parser.add_argument('--dataset_dir', type=str, default=None, help='location of nuscenes directory, default is OpenPCDet/data/nuscenes (constructed as relative path)')
     args = parser.parse_args()
 
     if args.func == 'create_nuscenes_infos':
         dataset_cfg = EasyDict(yaml.load(open(args.cfg_file)))
-        ROOT_DIR = (Path(__file__).resolve().parent / '../../../').resolve()
+        if (args.dataset_dir is None):
+            ROOT_DIR = (Path(__file__).resolve().parent / '../../../').resolve()
+            dataset_dir = ROOT_DIR / 'data' / 'nuscenes'
+        else:
+            dataset_dir = Path(args.dataset_dir).resolve()
         dataset_cfg.VERSION = args.version
         create_nuscenes_info(
             version=dataset_cfg.VERSION,
-            data_path=ROOT_DIR / 'data' / 'nuscenes',
-            save_path=ROOT_DIR / 'data' / 'nuscenes',
+            data_path=dataset_dir,
+            save_path=dataset_dir,
             max_sweeps=dataset_cfg.MAX_SWEEPS,
+            max_sweeps_radar=dataset_cfg.MAX_SWEEPS_RADAR
         )
 
         nuscenes_dataset = NuScenesDataset(
             dataset_cfg=dataset_cfg, class_names=None,
-            root_path=ROOT_DIR / 'data' / 'nuscenes',
+            root_path=dataset_dir,
             logger=common_utils.create_logger(), training=True
         )
         nuscenes_dataset.create_groundtruth_database(max_sweeps=dataset_cfg.MAX_SWEEPS)
